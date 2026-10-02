@@ -28,6 +28,15 @@
 求**改期行程**（变动航段最少 → 抵达最早 → 出发分钟序列字典序），窗口内无解则只返回
 风险与无解标记，**绝不修改已确认快照**。
 
+**本轮新增同修订批次**：调度员可把**同一潮位修订**下按优先顺序排列的 **2～5 艘船**
+作为一个批次**预排**（`POST /api/trips/batch/plan`，只读不占位）——逐艘沿用单船
+最早抵达 + 同刻航段序列字典序择优，后船同时避开**全部已确认占用**与**本批前船的拟
+占用**，任一船无解即返回首个失败序号；随后用**批次幂等键**一次性**确认整批**
+（`POST /api/trips/batch/confirm`）：单事务内核订最新修订与当时占用、逐艘复算并
+逐段比对，过期 `REVISION_STALE`、任一船无解或不一致 `PLAN_MISMATCH` 且**全批不
+保存**；通过则一次写入全部不可变快照。同键同内容重试返回原结果（`replayed=true`，
+即使修订已更新），同键异内容 `BATCH_KEY_CONFLICT`。旧单船接口语义完全不变。
+
 ---
 
 ## 1. 启动
@@ -138,6 +147,34 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
   3. 复核通过后保存**当时的结果快照**（修订号、参数、到达分钟、完整行程 JSON）。
      之后再发生潮位更正不影响已确认行程；快照的占用也随之永久生效，后续规划/确认
      必须避开（快照彼此重叠亦原样保留）。
+- **批次预排**（同一潮位修订下 2～5 艘船）：
+  - `ships` 按**优先顺序**给出（2～5 艘，数量越界或任一船字段非法均
+    `422 VALIDATION_ERROR`）；整批共用一个 `revision`（可省略，省略时解析为
+    **最新**修订，预排响应回带实际所据修订号）。
+  - 逐艘调用与单船完全相同的规划（最早抵达 + 同刻航段编号序列字典序）；第 i 艘船
+    须避开的占用 = 窗口覆盖区间内的**全部已确认快照占用** ∪ 本批第 0..i-1 艘船的
+    **拟占用**（与已确认占用同口径：进入分钟 `d` 占 `d..d+t-1`，抵达分钟不占）。
+  - 预排**只读、不占位**：不写库、不产生占用，可任意重复调用；每次调用内部从第 0 艘
+    重新串行规划。
+  - 任一船规划失败时按**首个失败序号**（`details.ship_index`，0 起）返回，沿用既有
+    错误码与状态：`NODE_NOT_FOUND`(404) / `MISSING_TIDE_DATA`(422) /
+    `NO_FEASIBLE_ITINERARY`(404)。
+- **批次确认**：请求携带**预排所据修订号**（必填）、各船按预排结果原样回填的
+  `itinerary` 与**批次幂等键** `idempotency_key`（非空字符串，≤128 字符）。服务在
+  单个 SQLite 事务（`BEGIN IMMEDIATE`）中：
+  1. 幂等键已存在且内容（修订号 + 各船参数与回填行程的规范化哈希）一致 ->
+     **直接返回首次结果**（HTTP 200、`replayed=true`），**不重新计算、不新增快照**，
+     即使其间修订已更新或占用已变化；同键异内容（含不同修订号）->
+     `409 BATCH_KEY_CONFLICT`；
+  2. 新键：先核订修订仍为最新，否则 `409 REVISION_STALE`，全批不保存；
+  3. 同一事务读取**当时全部已确认占用**，按请求顺序逐艘复算：窗口内无解 ->
+     `409 PLAN_MISMATCH`（`details.ship_index` 指出首个失败序号、
+     `reason=no_feasible_itinerary`）；复算行程与提交行程逐段不一致（或抵达分钟
+     不一致）-> `409 PLAN_MISMATCH`（`reason=itinerary_mismatch`）；前船的**复算**
+     行程随即并入后船的当时占用；任一船失败**全批回滚、不保存任何快照**；
+  4. 全部通过后在同一事务内一次写入各船不可变快照（与单船确认写入同一张
+     `confirmed_trips` 表，立即可经 `/api/trips` 读取、占用立即生效）并登记幂等记录，
+     返回各船 `index / trip_id / arrival_minute / itinerary`。
 - **更正后复核 / 改期**（只读，不改写快照、建议不占位）：携带已确认行程号与目标
   修订号（名义更正或误差修订均可），
   1. **原航路复核**：**只按目标修订检查潮位**——按快照中的航段编号顺序与原占用分钟
@@ -177,8 +214,12 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 窗口内有分钟缺名义潮位 / 误差修订提交分钟在基础修订无名义潮位 | 422 | `MISSING_TIDE_DATA`（`details` 给出缺失分钟列表与数量） |
 | 窗口内无可行行程（含所有潮位可行区间均被已确认占用占满） | 404 | `NO_FEASIBLE_ITINERARY` |
 | 参数校验失败（窗口>1440、航时非正、误差为负、分钟为负等） | 422 | `VALIDATION_ERROR` |
-| 确认时修订已过期 | 409 | `REVISION_STALE` |
+| 确认时修订已过期（单船与批次一致） | 409 | `REVISION_STALE` |
 | 确认时行程复核不一致（潮位重算结果不同，或占用变化使提交行程不再最优/已无可行解） | 409 | `PLAN_MISMATCH` |
+| 批次预排中任一船失败（未知节点/缺潮位/无可行行程） | 同既有码 | 既有码，`details.ship_index` 给出首个失败序号（0 起） |
+| 批次确认中任一船无解或与复算不一致 | 409 | `PLAN_MISMATCH`（`details.ship_index`/`reason`，全批不保存） |
+| 同批次幂等键提交了不同内容（或不同修订号） | 409 | `BATCH_KEY_CONFLICT`（不保存） |
+| 批次船数不在 2～5、幂等键缺失/过长、字段非法 | 422 | `VALIDATION_ERROR` |
 
 ---
 
@@ -193,6 +234,12 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 > - `POST /api/trips/{id}/review`：原快照仍只按目标修订的潮位误差带复核；需要改期时，
 >   建议避开**其他**已确认快照占用（排除自身），保持原航段顺序与原择优规则，
 >   **建议不占位、快照不改写**；窗口内无解沿用 `no_solution=true`。
+> - **本轮新增批次端点**：`POST /api/trips/batch/plan` 按优先顺序预排 2～5 艘船
+>   （后船避开已确认占用 + 本批前船拟占用，只读不占位，首个失败序号见
+>   `details.ship_index`）；`POST /api/trips/batch/confirm` 在单事务内核订最新修订、
+>   逐艘复算逐段比对，`REVISION_STALE` / `PLAN_MISMATCH` 全批不保存，成功凭
+>   `idempotency_key` 一次写入全部快照，同键同内容重放原结果、同键异内容
+>   `BATCH_KEY_CONFLICT`。
 > - 启动方式不变（`docker compose up` / `docker run` / `uvicorn app.main:app`）。
 
 | 方法 | 路径 | 说明 |
@@ -207,6 +254,8 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/tide/error-revisions` | 预测误差修订（名义潮位不变），生成新修订 |
 | POST | `/api/trips/plan` | 规划最早抵达行程 |
 | POST | `/api/trips/confirm` | 携带修订号确认行程（事务复核） |
+| POST | `/api/trips/batch/plan` | **本轮新增**：同修订 2～5 艘船按优先顺序批次预排（只读不占位，后船避前船拟占用） |
+| POST | `/api/trips/batch/confirm` | **本轮新增**：携带修订号 + 幂等键批次确认（事务逐艘复算，全成全败、幂等重放） |
 | POST | `/api/trips/{trip_id}/review` | 更正后按目标修订复核原行程，不安全时求改期 |
 | GET | `/api/trips` | 已确认行程列表 |
 | GET | `/api/trips/{trip_id}` | 已确认行程快照详情 |
@@ -305,6 +354,87 @@ POST /api/trips/confirm
 
 成功返回 `201`，响应为含 `trip_id / revision / arrival_minute / itinerary / confirmed_at`
 的不可变快照；过期返回 `409 REVISION_STALE`。
+
+### 批次预排 / 确认请求与响应示例（本轮新增）
+
+同一潮位修订下，把按**优先顺序**排列的 2～5 艘船一次预排。每艘船的字段与单船
+`/api/trips/plan` 完全一致；`revision` 提升到批次级（可省略，省略时取最新修订，
+响应回带实际所据修订号）：
+
+```json
+POST /api/trips/batch/plan
+{
+  "revision": 1,
+  "ships": [
+    {"origin":"A","destination":"D","start_minute":0,"window_minutes":1440,"draft":5.0,"height":2.0,"margin":0.5},
+    {"origin":"A","destination":"D","start_minute":0,"window_minutes":1440,"draft":5.0,"height":2.0,"margin":0.5}
+  ]
+}
+```
+
+响应为 `revision` + `ships`；每艘船带 `index`（0 起，即优先顺序）与单船规划同形的
+行程结果。船 1 的结果会避开船 0 的**拟占用**（演示库中船 0 于第 90 分钟抵达，
+船 1 整体后移，第 130 分钟抵达）：
+
+```json
+{
+  "revision": 1,
+  "ships": [
+    {"index":0,"arrival_minute":90,"itinerary":[ /* seg1: 0..30, seg2: 30..70, seg3: 70..90 */ ]},
+    {"index":1,"arrival_minute":130,"itinerary":[ /* seg1: 40..70, seg2: 70..110, seg3: 110..130 */ ]}
+  ]
+}
+```
+
+- 船数不在 2～5 或任一船字段非法（窗口 >1440、负吃水等）-> `422 VALIDATION_ERROR`；
+- 任一船未知节点 / 窗口缺潮位 / 无可行行程 -> 沿用 `NODE_NOT_FOUND` /
+  `MISSING_TIDE_DATA` / `NO_FEASIBLE_ITINERARY`，`details.ship_index` 给出首个
+  失败序号（0 起）；
+- 预排**不占位**，重复调用结果一致（前提是占用/修订未变）。
+
+确认时回填各船预排行程，并额外提供**必填** `revision` 与批次**幂等键**
+`idempotency_key`：
+
+```json
+POST /api/trips/batch/confirm
+{
+  "revision": 1,
+  "idempotency_key": "tide-window-2026-10-02-am-batch",
+  "ships": [
+    {"origin":"A","destination":"D","start_minute":0,"window_minutes":1440,
+     "draft":5.0,"height":2.0,"margin":0.5,
+     "itinerary":[ /* 预排 ships[0].itinerary 原样回填 */ ]},
+    {"origin":"A","destination":"D","start_minute":0,"window_minutes":1440,
+     "draft":5.0,"height":2.0,"margin":0.5,
+     "itinerary":[ /* 预排 ships[1].itinerary 原样回填 */ ]}
+  ]
+}
+```
+
+首次成功返回 `201`，一次写入整批不可变快照：
+
+```json
+{
+  "idempotency_key": "tide-window-2026-10-02-am-batch",
+  "revision": 1,
+  "replayed": false,
+  "trips": [
+    {"index":0,"trip_id":7,"revision":1,"arrival_minute":90, "itinerary":[ /* … */ ]},
+    {"index":1,"trip_id":8,"revision":1,"arrival_minute":130,"itinerary":[ /* … */ ]}
+  ]
+}
+```
+
+- **同键同内容重试**：返回 `200`、`replayed=true` 与**首次相同的各行程号**，
+  服务不再复算、不新增快照——即使这期间潮位已生成新修订或占用已变化；
+- **同键异内容**（改任一船参数/行程，或换修订号）：`409 BATCH_KEY_CONFLICT`，
+  不保存；请换新幂等键；
+- **修订过期**：`409 REVISION_STALE`（`provided_revision/current_revision`）；
+- **复算无解或逐段不一致**：`409 PLAN_MISMATCH`，`details.ship_index` 指出首个
+  失败船、`reason` 为 `no_feasible_itinerary` 或 `itinerary_mismatch`，**全批回滚**；
+- 批次写入的每条快照都出现在 `GET /api/trips` / `GET /api/trips/{id}` 中，占用
+  立即对后续单船/批次规划生效；旧单船 `/api/trips/plan`、`/api/trips/confirm`
+  接口路径、字段与冲突语义均保持不变。
 
 ### 更正后复核 / 改期请求与响应示例
 
@@ -437,6 +567,39 @@ curl -s -X POST $BASE/api/trips/confirm -H 'Content-Type: application/json' \
 # 7) 潮位修订后复核改期：改期建议避开其他已确认船的占用（排除被复核行程自身），
 #    建议不占位、快照不改写
 curl -s -X POST $BASE/api/trips/$TID/review -H 'Content-Type: application/json' -d '{}'
+
+# 8) 本轮新增：同修订批次预排（2～5 艘，按优先顺序；后船自动避开前船拟占用，不占位）
+curl -s -X POST $BASE/api/trips/batch/plan -H 'Content-Type: application/json' -d '{
+  "revision": 1,
+  "ships": [
+    {"origin":"A","destination":"D","start_minute":0,"window_minutes":1440,"draft":5.0,"height":2.0,"margin":0.5},
+    {"origin":"A","destination":"D","start_minute":0,"window_minutes":1440,"draft":5.0,"height":2.0,"margin":0.5}
+  ]
+}' > /tmp/batch_plan.json
+
+# 9) 批次确认：把预排各船行程连同 revision 与批次幂等键一起提交（全成全败）
+python3 - <<'PY'
+import json
+plan = json.load(open("/tmp/batch_plan.json"))
+body = {
+    "revision": plan["revision"],
+    "idempotency_key": "demo-batch-0001",
+    "ships": [
+        {"origin": s["origin"], "destination": s["destination"],
+         "start_minute": s["start_minute"], "window_minutes": s["window_minutes"],
+         "draft": s["draft"], "height": s["height"], "margin": s["margin"],
+         "itinerary": s["itinerary"]}
+        for s in plan["ships"]
+    ],
+}
+json.dump(body, open("/tmp/batch_confirm.json", "w"), ensure_ascii=False)
+PY
+curl -s -X POST $BASE/api/trips/batch/confirm \
+  -H 'Content-Type: application/json' -d @/tmp/batch_confirm.json
+# 同键同内容重试 -> 200 且 replayed=true、行程号不变；
+# 同键异内容 -> 409 BATCH_KEY_CONFLICT；修订过期 -> 409 REVISION_STALE
+curl -s -i -X POST $BASE/api/trips/batch/confirm \
+  -H 'Content-Type: application/json' -d @/tmp/batch_confirm.json | head -1
 ```
 
 Python 示例（规划 → 确认 → 更正 → 复核/改期）：
@@ -475,6 +638,43 @@ else:
     print("新出发分钟：", [l["start_minute"] for l in rs["itinerary"]])
 ```
 
+Python 示例（同修订批次预排 → 确认 → 幂等重试）：
+
+```python
+import requests
+
+B = "http://localhost:8000"
+ships = [
+    {"origin": "A", "destination": "D", "start_minute": 0, "window_minutes": 1440,
+     "draft": 5.0, "height": 2.0, "margin": 0.5},
+    {"origin": "B", "destination": "D", "start_minute": 60, "window_minutes": 1380,
+     "draft": 4.0, "height": 1.0, "margin": 0.3},
+]
+
+# 1) 批次预排（只读不占位；ships[1] 会避开 ships[0] 的拟占用）
+plan = requests.post(f"{B}/api/trips/batch/plan",
+                     json={"revision": 1, "ships": ships}).json()
+
+# 2) 原样回填各船行程 + 修订号 + 批次幂等键，一次确认整批
+confirm_body = {
+    "revision": plan["revision"],
+    "idempotency_key": "batch-2026-10-02-001",
+    "ships": [
+        {**ships[i], "itinerary": plan["ships"][i]["itinerary"]}
+        for i in range(len(ships))
+    ],
+}
+r = requests.post(f"{B}/api/trips/batch/confirm", json=confirm_body)
+r.raise_for_status()
+for t in r.json()["trips"]:
+    print("船", t["index"], "-> 行程号", t["trip_id"],
+          "抵达分钟", t["arrival_minute"])
+
+# 3) 网络重试：同键同内容安全重放（即使期间已产生新修订）
+retry = requests.post(f"{B}/api/trips/batch/confirm", json=confirm_body)
+assert retry.status_code == 200 and retry.json()["replayed"] is True
+```
+
 录入自定义数据：
 
 ```bash
@@ -504,6 +704,26 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 
 剪枝依据：若序列 `s1 < s2`（字典序），则对任意后缀 `x` 恒有 `s1+x < s2+x`，
 故同一 `(节点, 分钟)` 只需保留最小序列，不会丢失最优解。复杂度 O(W·E)（W≤1440）。
+
+### 同修订批次预排 / 确认（实现见 `app/services/batch.py`）
+
+1. **批次预排**：先解析批次修订号（显式指定须存在，否则取最新；未知沿用
+   `TIDE_REVISION_NOT_FOUND`）；一次读取覆盖全批各船窗口并集区间
+   `[min(start), max(start+window-1)]` 的全部已确认占用。随后按 `ships` 优先顺序
+   逐艘调用上面的单船 DP（同一修订、同一择优规则），每艘规划成功后把其行程
+   `d..d+t-1` 并入内存中的 blocked 集合作为**下一艘**的占用；预排全程只读。
+   任一船抛 `NODE_NOT_FOUND` / `MISSING_TIDE_DATA` / `NO_FEASIBLE_ITINERARY` 时，
+   原样附加 `ship_index`（首个失败序号，0 起）后抛出。
+2. **批次确认**（单事务 `BEGIN IMMEDIATE`）：先按幂等键查 `batch_confirmations`：
+   命中且内容哈希（请求体去掉幂等键后的规范化 SHA-256）与修订号一致 -> 直接返回
+   存储的首次结果（标记 `replayed=true`，**优先于修订新鲜度检查**）；命中但不一致
+   -> `BATCH_KEY_CONFLICT`。新键时依次做：修订新鲜度（`REVISION_STALE`）->
+   读取当时已确认占用 -> 逐艘复算（`NO_FEASIBLE_ITINERARY` 转
+   `PLAN_MISMATCH(no_feasible_itinerary)`，与提交行程六元组逐段或抵达分钟不一致转
+   `PLAN_MISMATCH(itinerary_mismatch)`，均带 `ship_index`）-> 复算通过即在同一事务
+   写入该船快照并把其**复算行程**并入后船占用。全部通过后写入幂等记录并 `COMMIT`；
+   任一异常 `ROLLBACK`，已插入快照随之撤销，实现全成全败。唯一键竞争（并发同键）
+   在回滚后按已存在记录重判重放/冲突。
 
 ### 更正后复核 / 改期（实现见 `app/services/reschedule.py`）
 
@@ -539,9 +759,10 @@ app/
   errors.py             # 统一业务错误（含 trip_not_found 构造器）
   schemas.py            # Pydantic 模型与入参校验（窗口<=1440、航时>0 等）
   services/planning.py  # 潮汐约束与时间展开 DP 规划算法
+  services/batch.py     # 同修订批次预排/确认（逐艘串行规划 + 事务复算 + 幂等键）
   services/reschedule.py# 更正后原行程复核与改期 DP（只读）
-  main.py               # FastAPI 路由（节点/航段/潮位更正与误差修订/规划/确认/复核改期）
-tests/                  # pytest 测试（65 个，含择优、缺潮位、事务冲突、误差带、复核改期、航段占用等）
+  main.py               # FastAPI 路由（节点/航段/潮位更正与误差修订/单船与批次规划确认/复核改期）
+tests/                  # pytest 测试（85 个，含择优、缺潮位、事务冲突、误差带、复核改期、航段占用、批次预排/确认/幂等等）
 Dockerfile
 docker-compose.yml
 requirements.txt

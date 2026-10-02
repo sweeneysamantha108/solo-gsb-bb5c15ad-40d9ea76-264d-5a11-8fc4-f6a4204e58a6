@@ -53,6 +53,14 @@ CREATE TABLE IF NOT EXISTS confirmed_trips (
     itinerary       TEXT NOT NULL,                          -- JSON 快照
     confirmed_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS batch_confirmations (
+    idempotency_key TEXT PRIMARY KEY,                      -- 批次幂等键
+    revision        INTEGER NOT NULL,                       -- 批次所据修订号
+    content_hash    TEXT NOT NULL,                          -- 提交内容（不含幂等键）的规范化哈希
+    result          TEXT NOT NULL,                          -- 首次成功结果 JSON（各行程号等）
+    confirmed_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

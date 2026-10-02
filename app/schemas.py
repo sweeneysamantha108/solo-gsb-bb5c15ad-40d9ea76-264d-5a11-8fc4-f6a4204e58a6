@@ -106,6 +106,71 @@ class ConfirmRequest(PlanRequest):
     itinerary: list[LegOut] = Field(description="按规划结果原样回填的行程（含 seg_id/起止分钟）")
 
 
+# ---- 批次预排 / 确认（同一潮位修订下 2～5 艘船成批处理） ---------------------------
+
+class BatchShipIn(BaseModel):
+    """批次中的一艘船：字段语义与 PlanRequest 的单船字段一致。"""
+    origin: str
+    destination: str
+    start_minute: int = Field(ge=0, description="规划窗口起点（绝对分钟，>=0）")
+    window_minutes: int = Field(gt=0, le=config.MAX_WINDOW, description="窗口长度，<=1440")
+    draft: float = Field(ge=0, description="船舶吃水（米）")
+    height: float = Field(ge=0, description="水面以上高度（米）")
+    margin: float = Field(ge=0, description="安全余量（米）")
+
+
+class BatchPlanRequest(BaseModel):
+    ships: list[BatchShipIn] = Field(
+        min_length=2, max_length=5,
+        description="按优先顺序排列的 2～5 艘船；排序靠后者须避开排序靠前者的拟占用",
+    )
+    revision: Optional[int] = Field(
+        default=None, description="整批共用的潮位修订号；不填用最新修订"
+    )
+
+
+class BatchPlanShipOut(PlanResponse):
+    index: int = Field(description="批次内序号（0 起，与请求中的优先顺序一致）")
+
+
+class BatchPlanResponse(BaseModel):
+    revision: int = Field(description="本次预排实际所据修订号（省略时解析为最新修订）")
+    ships: list[BatchPlanShipOut]
+
+
+class BatchShipConfirmIn(BatchShipIn):
+    itinerary: list[LegOut] = Field(description="该船预排结果原样回填（含 seg_id/起止分钟）")
+
+
+class BatchConfirmRequest(BaseModel):
+    ships: list[BatchShipConfirmIn] = Field(
+        min_length=2, max_length=5,
+        description="按预排时同一优先顺序排列的 2～5 艘船及其预排行程",
+    )
+    revision: int = Field(description="预排所据潮位修订号（批次确认必填）")
+    idempotency_key: str = Field(
+        min_length=1, max_length=128,
+        description="批次幂等键：同键同内容重试返回原结果；同键异内容冲突",
+    )
+
+
+class BatchTripOut(BaseModel):
+    index: int = Field(description="批次内序号（0 起，与请求顺序一致）")
+    trip_id: int
+    revision: int
+    arrival_minute: int
+    itinerary: list[LegOut]
+
+
+class BatchConfirmResponse(BaseModel):
+    idempotency_key: str
+    revision: int
+    replayed: bool = Field(
+        description="true=同键同内容重试，直接返回首次结果（未重新计算/保存）"
+    )
+    trips: list[BatchTripOut]
+
+
 class TripOut(BaseModel):
     trip_id: int
     revision: int

@@ -12,6 +12,10 @@ from . import config
 from .database import get_conn, init_db
 from .errors import ApiError
 from .schemas import (
+    BatchConfirmRequest,
+    BatchConfirmResponse,
+    BatchPlanRequest,
+    BatchPlanResponse,
     ConfirmRequest,
     NodeIn,
     PlanRequest,
@@ -25,6 +29,7 @@ from .schemas import (
     TripOut,
     TripReviewOut,
 )
+from .services.batch import confirm_batch, plan_batch
 from .services.planning import find_itinerary, load_occupancy
 from .services.reschedule import review_and_reschedule
 
@@ -435,6 +440,43 @@ def _payload_arrival(body: ConfirmRequest) -> Optional[int]:
     if not body.itinerary:
         return body.start_minute
     return body.itinerary[-1].end_minute
+
+
+# ---- 批次预排 / 确认（同一修订下 2～5 艘船） ---------------------------------------
+
+@app.post("/api/trips/batch/plan",
+          response_model=BatchPlanResponse, tags=["trips", "batch"])
+def plan_trip_batch(body: BatchPlanRequest):
+    """批次预排（只读、不占位）。
+
+    按 ships 给出的优先顺序逐艘沿用单船最早抵达 + 同刻航段序列字典序
+    择优；后船同时避开全部已确认占用与本批前船的拟占用。任一船无解
+    （或未知节点/缺潮位）时，错误 details 给出首个失败序号 ship_index
+    （0 起）。revision 省略时整批采用最新修订。
+    """
+    with get_conn() as conn:
+        result = plan_batch(conn, body.ships, body.revision)
+    return result
+
+
+@app.post("/api/trips/batch/confirm",
+          status_code=201, response_model=BatchConfirmResponse,
+          tags=["trips", "batch"])
+def confirm_trip_batch(body: BatchConfirmRequest):
+    """批次确认：单事务内核订最新修订与当时占用，逐艘复算并逐段比对。
+
+    - 修订过期 -> 409 REVISION_STALE；
+    - 任一船无解或与提交行程不一致 -> 409 PLAN_MISMATCH（details.ship_index
+      指出首个失败序号），全批不保存；
+    - 全部通过则一次写入全部不可变快照并登记幂等键；同键同内容重试返回
+      原结果（200，replayed=true，即使修订已更新）；同键异内容
+      409 BATCH_KEY_CONFLICT。
+    """
+    with get_conn() as conn:
+        result, replayed = confirm_batch(conn, body)
+    if replayed:
+        return JSONResponse(status_code=200, content=result)
+    return result
 
 
 @app.get("/api/trips", response_model=list[TripOut], tags=["trips"])
