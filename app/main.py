@@ -12,6 +12,11 @@ from . import config
 from .database import get_conn, init_db
 from .errors import ApiError
 from .schemas import (
+    BatchConfirmRequest,
+    BatchConfirmResponse,
+    BatchPlanRequest,
+    BatchPlanResponse,
+    BatchTripOut,
     ConfirmRequest,
     NodeIn,
     PlanRequest,
@@ -25,6 +30,7 @@ from .schemas import (
     TripOut,
     TripReviewOut,
 )
+from .services.batch import confirm_batch, plan_batch
 from .services.planning import find_itinerary, load_occupancy
 from .services.reschedule import review_and_reschedule
 
@@ -435,6 +441,79 @@ def _payload_arrival(body: ConfirmRequest) -> Optional[int]:
     if not body.itinerary:
         return body.start_minute
     return body.itinerary[-1].end_minute
+
+
+# ---- 批次预排 / 确认（2～5 艘船共用同一潮位修订） ---------------------------------
+
+@app.post("/api/trips/batch/plan", response_model=BatchPlanResponse, tags=["trips"])
+def plan_trip_batch(body: BatchPlanRequest):
+    """批次预排（只读、不占位）：按优先顺序逐艘沿用单船择优规则，后船避开
+    已确认占用及本批前船拟占用；任一船无解返回该船序号。"""
+    with get_conn() as conn:
+        result = plan_batch(conn, body.revision, body.ships)
+    return result
+
+
+@app.post("/api/trips/batch/confirm", tags=["trips"])
+def confirm_trip_batch(body: BatchConfirmRequest):
+    """批次确认：单事务内核对最新修订与当时占用，逐艘复算并逐段比对；
+    任一船无解或不一致 PLAN_MISMATCH 且全批不保存；修订过期 REVISION_STALE。
+    同 batch_key 同内容重放返回原行程号，同键异内容 IDEMPOTENCY_CONFLICT。"""
+    with get_conn() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            result = confirm_batch(conn, body.revision, body.batch_key, body.ships)
+
+            rows = []
+            for trip_id in result["trip_ids"]:
+                row = conn.execute(
+                    "SELECT * FROM confirmed_trips WHERE trip_id = ?", (trip_id,)
+                ).fetchone()
+                if row is None:
+                    raise ApiError(
+                        500, "INTERNAL_ERROR",
+                        f"批次行程号 {trip_id} 在事务内不可读", {"trip_id": trip_id},
+                    )
+                rows.append(dict(row))
+            conn.execute("COMMIT")
+        except ApiError:
+            conn.execute("ROLLBACK")
+            raise
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    trips = [
+        {"ship_index": idx, "trip": _batch_trip_out(row)}
+        for idx, row in enumerate(rows, start=1)
+    ]
+    content = BatchConfirmResponse(
+        batch_key=result["batch_key"],
+        revision=result["revision"],
+        replayed=result["replayed"],
+        trips=trips,
+    )
+    # 首次确认 201；幂等重放 200（未产生新快照）
+    status = 200 if result["replayed"] else 201
+    return JSONResponse(status_code=status, content=content.model_dump())
+
+
+def _batch_trip_out(d: dict) -> BatchTripOut:
+    return BatchTripOut(
+        trip_id=d["trip_id"],
+        revision=d["revision"],
+        origin=d["origin"],
+        destination=d["destination"],
+        start_minute=d["start_minute"],
+        window_minutes=d["window_minutes"],
+        draft=d["draft"],
+        height=d["height"],
+        margin=d["margin"],
+        arrival_minute=d["arrival_minute"],
+        itinerary=json.loads(d["itinerary"]),
+        confirmed_at=d["confirmed_at"],
+        batch_key=d["batch_key"],
+    )
 
 
 @app.get("/api/trips", response_model=list[TripOut], tags=["trips"])

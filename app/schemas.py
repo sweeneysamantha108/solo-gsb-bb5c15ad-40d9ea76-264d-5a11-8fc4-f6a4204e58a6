@@ -194,3 +194,81 @@ class TripReviewOut(BaseModel):
         default=False, description="不安全且窗口内无改期解时为 true（快照不被修改）"
     )
     original_itinerary: list[LegOut]
+
+
+# ---- 批次预排 / 确认（同一潮位修订下 2~5 艘船） -----------------------------------
+
+class BatchShipRequest(BaseModel):
+    """批次中的单船参数：字段语义与单船 /api/trips/plan 请求完全一致。"""
+    origin: str
+    destination: str
+    start_minute: int = Field(ge=0, description="规划窗口起点（绝对分钟，>=0）")
+    window_minutes: int = Field(gt=0, le=config.MAX_WINDOW, description="窗口长度，<=1440")
+    draft: float = Field(ge=0, description="船舶吃水（米）")
+    height: float = Field(ge=0, description="水面以上高度（米）")
+    margin: float = Field(ge=0, description="安全余量（米）")
+
+
+class BatchPlanRequest(BaseModel):
+    revision: Optional[int] = Field(
+        default=None, description="全批共用的潮位修订号；不填用最新修订"
+    )
+    ships: list[BatchShipRequest] = Field(
+        min_length=2, max_length=5,
+        description="按优先顺序排列的船舶，2～5 艘；后者须避开本批前者的拟占用",
+    )
+
+
+class BatchShipPlanOut(BaseModel):
+    """批次预排中单船结果（只读、不占位）。"""
+    ship_index: int = Field(description="在批次中的序号（1 起）")
+    plan: PlanResponse
+
+
+class BatchPlanResponse(BaseModel):
+    revision: int = Field(description="本次预排实际使用（解析后）的潮位修订号")
+    ships: list[BatchShipPlanOut]
+
+
+class BatchConfirmShip(BaseModel):
+    """批次确认中的单船提交：船舶参数 + 预排返回的完整行程。"""
+    origin: str
+    destination: str
+    start_minute: int = Field(ge=0)
+    window_minutes: int = Field(gt=0, le=config.MAX_WINDOW)
+    draft: float = Field(ge=0)
+    height: float = Field(ge=0)
+    margin: float = Field(ge=0)
+    itinerary: list[LegOut] = Field(description="预排结果原样回填的完整行程")
+
+
+class BatchConfirmRequest(BaseModel):
+    revision: int = Field(description="预排所据潮位修订号（必填，确认时核对是否仍最新）")
+    batch_key: str = Field(
+        min_length=1, max_length=128,
+        description="批次幂等键：同键同内容重放返回原结果，同键异内容冲突",
+    )
+    ships: list[BatchConfirmShip] = Field(
+        min_length=2, max_length=5,
+        description="按优先顺序排列的船舶提交（顺序与预排一致），2～5 艘",
+    )
+
+
+class BatchTripOut(TripOut):
+    batch_key: Optional[str] = Field(default=None, description="所属批次幂等键")
+
+
+class BatchShipResultOut(BaseModel):
+    ship_index: int = Field(description="在批次中的序号（1 起）")
+    trip: BatchTripOut
+
+
+class BatchConfirmResponse(BaseModel):
+    batch_key: str
+    revision: int
+    replayed: bool = Field(
+        description="true=同键同内容幂等重放（返回原行程号，不重新保存）"
+    )
+    trips: list[BatchShipResultOut] = Field(
+        description="按提交顺序对应的不可变行程快照（含行程号）"
+    )

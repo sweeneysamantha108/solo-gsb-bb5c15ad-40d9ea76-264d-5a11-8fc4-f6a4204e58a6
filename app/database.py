@@ -51,7 +51,17 @@ CREATE TABLE IF NOT EXISTS confirmed_trips (
     margin          REAL NOT NULL,
     arrival_minute  INTEGER NOT NULL,
     itinerary       TEXT NOT NULL,                          -- JSON 快照
+    batch_key       TEXT,                                   -- 批次确认幂等键；单船接口为空
     confirmed_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 批次确认的幂等记录：同批次键同内容重放直接返回原行程号；同键异内容冲突
+CREATE TABLE IF NOT EXISTS batch_confirmations (
+    batch_key     TEXT PRIMARY KEY,                         -- 批次幂等键
+    revision      INTEGER NOT NULL,                         -- 确认时所据（且当时最新）修订号
+    request_hash  TEXT NOT NULL,                            -- 请求内容规范化哈希（SHA-256）
+    trip_ids      TEXT NOT NULL,                            -- JSON：按提交顺序的行程号 [id, ...]
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
 
@@ -85,10 +95,16 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """旧版数据库平滑升级：为 tide_values 补 error 列（既有行误差取 0）。"""
+    """旧版数据库平滑升级：为 tide_values 补 error 列（既有行误差取 0）；
+    为 confirmed_trips 补 batch_key 列（既有单船行程为空）。"""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(tide_values)").fetchall()}
     if "error" not in cols:
         conn.execute("ALTER TABLE tide_values ADD COLUMN error REAL NOT NULL DEFAULT 0.0")
+    trip_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(confirmed_trips)").fetchall()
+    }
+    if "batch_key" not in trip_cols:
+        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN batch_key TEXT")
 
 
 # ---------------------------------------------------------------------------
